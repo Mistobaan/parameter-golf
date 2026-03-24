@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flash_attn_interface import flash_attn_func
+from flash_attn_interface import flash_attn_func, _flash_attn_forward
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -55,21 +55,22 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 10))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288 * 16))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_layers = int(os.environ.get("NUM_LAYERS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 2048))
-    num_heads = int(os.environ.get("NUM_HEADS", 2048/256))
-    mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    head_dim = int(os.environ.get("HEAD_DIM", 128))
+    model_dim = int(os.environ.get("MODEL_DIM", num_heads * head_dim))
+    mlp_mult = int(os.environ.get("MLP_MULT", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_base = float(os.environ.get("ROPE_BASE", 100_000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 10.0))
 
     # Optimizer hyperparameters.
@@ -525,10 +526,10 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, head_dim: int, base: float = 10000.0):
+    def __init__(self, head_dim: int, base: float = 100_000.0):
         super().__init__()
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))        
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
         
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
@@ -587,6 +588,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         # self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        # self.k_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -595,17 +597,17 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).view(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        # q = F.rms_norm(q, (q.size(-1),))
-        # k = F.rms_norm(k, (k.size(-1),))
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q *= 1.2 # self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        k *= 1.2
+        # q *= self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        # k *= self.k_gain.to(dtype=k.dtype)[None, None, :, None]
         # dtype = torch.float8_e4m3fn
         # q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
         y = flash_attn_func(q, k, v, causal=True)
-        #y = y.to(x.dtype)
+        # y = y.to(x.dtype)
         y = y.contiguous().view(bsz, seqlen, dim)
         return self.proj(y)
 
