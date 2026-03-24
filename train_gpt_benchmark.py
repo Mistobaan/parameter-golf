@@ -27,8 +27,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flash_attn_interface import flash_attn_func
-
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -54,23 +52,26 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    benchmark_only = bool(int(os.environ.get("BENCHMARK_ONLY", "0")))
+    benchmark_steps = int(os.environ.get("BENCHMARK_STEPS", 100))
+    benchmark_log_every = int(os.environ.get("BENCHMARK_LOG_EVERY", 10))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 4))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 2048))
-    num_heads = int(os.environ.get("NUM_HEADS", 2048/256))
-    mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 10.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -278,6 +279,190 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def reduce_float(value: float, device: torch.device, op: dist.ReduceOp.RedOpType) -> float:
+    tensor = torch.tensor(value, device=device, dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(tensor, op=op)
+    return float(tensor.item())
+
+
+def log_compiled_model_summary(log0, base_model: GPT, compiled_model: nn.Module) -> None:
+    dtype_param_counts: dict[str, int] = {}
+    dtype_tensor_counts: dict[str, int] = {}
+    param_lines: list[str] = []
+    for name, param in base_model.named_parameters():
+        dtype_name = str(param.dtype).removeprefix("torch.")
+        dtype_param_counts[dtype_name] = dtype_param_counts.get(dtype_name, 0) + int(param.numel())
+        dtype_tensor_counts[dtype_name] = dtype_tensor_counts.get(dtype_name, 0) + 1
+        param_lines.append(f"{name}:{tuple(param.shape)}:{dtype_name}")
+
+    dtype_summary = "\n".join(
+        f"{dtype}:params={dtype_param_counts[dtype]} tensors={dtype_tensor_counts[dtype]}"
+        for dtype in sorted(dtype_param_counts)
+    )
+    log0(
+        f"compiled_model:type:{type(compiled_model).__name__} "
+        f"module_type:{type(base_model).__name__} device:{next(base_model.parameters()).device}"
+    )
+    log0(
+        f"compiled_model_dims:vocab_size:{base_model.tok_emb.num_embeddings} "
+        f"model_dim:{base_model.tok_emb.embedding_dim} "
+        f"num_layers:{len(base_model.blocks)} encoder_layers:{base_model.num_encoder_layers} "
+        f"decoder_layers:{base_model.num_decoder_layers} num_heads:{base_model.blocks[0].attn.num_heads} "
+        f"num_kv_heads:{base_model.blocks[0].attn.num_kv_heads} "
+        f"head_dim:{base_model.blocks[0].attn.head_dim} "
+        f"mlp_hidden_dim:{base_model.blocks[0].mlp.fc.out_features} "
+        f"tie_embeddings:{base_model.tie_embeddings}"
+    )
+    log0(f"compiled_model_precision:{dtype_summary}")
+    log0(f"compiled_model_params:{' '.join(param_lines)}")
+
+
+def log_benchmark_results(
+    log0,
+    device: torch.device,
+    world_size: int,
+    train_batch_tokens: int,
+    benchmark_steps: int,
+    wall_step_ms: list[float],
+    gpu_step_ms: list[float],
+) -> None:
+    if benchmark_steps <= 0:
+        raise ValueError(f"BENCHMARK_STEPS must be positive, got {benchmark_steps}")
+    wall_step_ms_np = np.asarray(wall_step_ms, dtype=np.float64)
+    gpu_step_ms_np = np.asarray(gpu_step_ms, dtype=np.float64)
+    mean_wall_ms = float(wall_step_ms_np.mean())
+    mean_gpu_ms = float(gpu_step_ms_np.mean())
+    global_tokens_per_s = train_batch_tokens / max(mean_wall_ms / 1000.0, 1e-12)
+    local_tokens_per_s = global_tokens_per_s / world_size
+    gpu_busy_ratio_est = min(mean_gpu_ms / max(mean_wall_ms, 1e-12), 1.0)
+
+    mean_wall_ms_global = reduce_float(mean_wall_ms, device, dist.ReduceOp.SUM) / world_size
+    mean_gpu_ms_global = reduce_float(mean_gpu_ms, device, dist.ReduceOp.SUM) / world_size
+    slowest_mean_wall_ms = reduce_float(mean_wall_ms, device, dist.ReduceOp.MAX)
+    fastest_mean_wall_ms = reduce_float(mean_wall_ms, device, dist.ReduceOp.MIN)
+    slowest_global_tokens_per_s = train_batch_tokens / max(slowest_mean_wall_ms / 1000.0, 1e-12)
+    local_tokens_per_s_global = slowest_global_tokens_per_s / world_size
+    gpu_busy_ratio_est_global = min(mean_gpu_ms_global / max(mean_wall_ms_global, 1e-12), 1.0)
+
+    log0(
+        f"benchmark:steps:{benchmark_steps} total_tokens:{train_batch_tokens * benchmark_steps} "
+        f"world_size:{world_size}"
+    )
+    log0(
+        f"benchmark_step_ms:mean:{mean_wall_ms_global:.3f} median:{float(np.median(wall_step_ms_np)):.3f} "
+        f"std:{float(wall_step_ms_np.std()):.3f} min:{float(wall_step_ms_np.min()):.3f} "
+        f"max:{float(wall_step_ms_np.max()):.3f} slowest_rank_mean:{slowest_mean_wall_ms:.3f} "
+        f"fastest_rank_mean:{fastest_mean_wall_ms:.3f}"
+    )
+    log0(
+        f"benchmark_gpu_ms:mean:{mean_gpu_ms_global:.3f} median:{float(np.median(gpu_step_ms_np)):.3f} "
+        f"std:{float(gpu_step_ms_np.std()):.3f} min:{float(gpu_step_ms_np.min()):.3f} "
+        f"max:{float(gpu_step_ms_np.max()):.3f}"
+    )
+    log0(
+        f"benchmark_throughput_tokens_per_s:global:{slowest_global_tokens_per_s:.1f} "
+        f"per_device:{local_tokens_per_s_global:.1f} measured_on:slowest_rank"
+    )
+    log0(
+        f"benchmark_utilization_est:gpu_busy_ratio:{gpu_busy_ratio_est_global:.4f} "
+        f"peak_memory_allocated_mib:{torch.cuda.max_memory_allocated(device) // 1024 // 1024} "
+        f"peak_memory_reserved_mib:{torch.cuda.max_memory_reserved(device) // 1024 // 1024}"
+    )
+
+
+def run_strict_benchmark(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    optimizer_muon: Muon,
+    train_loader,
+    grad_accum_steps: int,
+    grad_scale: float,
+    distributed: bool,
+    device: torch.device,
+    world_size: int,
+    log0,
+) -> None:
+    if args.benchmark_steps <= 0:
+        raise ValueError(f"BENCHMARK_STEPS must be positive, got {args.benchmark_steps}")
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    model.train()
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    wall_step_ms: list[float] = []
+    gpu_step_ms: list[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    for step in range(args.benchmark_steps):
+        zero_grad_all()
+        if distributed:
+            dist.barrier()
+        torch.cuda.synchronize(device)
+        wall_t0 = time.perf_counter()
+        start_event.record()
+
+        train_loss = torch.zeros((), device=device)
+        for micro_step in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            train_loss += loss.detach()
+            (loss * grad_scale).backward()
+        train_loss /= grad_accum_steps
+
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = args.muon_momentum
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"]
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        zero_grad_all()
+
+        end_event.record()
+        torch.cuda.synchronize(device)
+        wall_ms = 1000.0 * (time.perf_counter() - wall_t0)
+        gpu_ms = float(start_event.elapsed_time(end_event))
+        wall_step_ms.append(wall_ms)
+        gpu_step_ms.append(gpu_ms)
+
+        should_log = (
+            args.benchmark_log_every > 0
+            and ((step + 1) <= 5 or (step + 1) % args.benchmark_log_every == 0 or (step + 1) == args.benchmark_steps)
+        )
+        if should_log:
+            step_global_tokens_per_s = args.train_batch_tokens / max(wall_ms / 1000.0, 1e-12)
+            log0(
+                f"benchmark_step:{step + 1}/{args.benchmark_steps} train_loss:{train_loss.item():.4f} "
+                f"step_ms:{wall_ms:.3f} gpu_ms:{gpu_ms:.3f} "
+                f"tokens_per_s_global:{step_global_tokens_per_s:.1f}"
+            )
+
+    if distributed:
+        model.require_backward_grad_sync = True
+    log_benchmark_results(
+        log0=log0,
+        device=device,
+        world_size=world_size,
+        train_batch_tokens=args.train_batch_tokens,
+        benchmark_steps=args.benchmark_steps,
+        wall_step_ms=wall_step_ms,
+        gpu_step_ms=gpu_step_ms,
+    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -525,11 +710,9 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, head_dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))        
-        
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -544,22 +727,16 @@ class Rotary(nn.Module):
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
-            # add batch and head dims for later broadcasting over seqlen and head_dim
-            self._cos_cached = freqs.cos()[None, :, None, :]
-            self._sin_cached = freqs.sin()[None, :, None, :]
-            
+            self._cos_cached = freqs.cos()[None, None, :, :]
+            self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    assert x.ndim == 4  # multihead attention batchsz, seqlen, numheads, headdim
-    _batchsz, _seqlen, _numheads, headdim  = x.shape
-    half = headdim // 2
+    half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], dim=3)
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -578,35 +755,38 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim = dim // num_heads
+        self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        self.c_q = CastedLinear(dim, num_heads * head_dim, bias=False)
-        self.c_k = CastedLinear(dim, num_kv_heads * head_dim, bias=False)
-        self.c_v = CastedLinear(dim, num_kv_heads * head_dim, bias=False)
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        # self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        # shape: (batchsize, seqlen, number of heads, head dimension) - fa3's native layout
-        q = self.c_q(x).view(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.c_k(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.c_v(x).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        # q = F.rms_norm(q, (q.size(-1),))
-        # k = F.rms_norm(k, (k.size(-1),))
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q *= 1.2 # self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        k *= 1.2
-        # dtype = torch.float8_e4m3fn
-        # q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-        y = flash_attn_func(q, k, v, causal=True)
-        #y = y.to(x.dtype)
-        y = y.contiguous().view(bsz, seqlen, dim)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -809,22 +989,30 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    val_tokens = None
+    base_bytes_lut = None
+    has_leading_space_lut = None
+    is_boundary_token_lut = None
+    if not args.benchmark_only:
+        if not args.tokenizer_path.endswith(".model"):
+            raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
+        )
+        log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    else:
+        log0("val_bpb:disabled benchmark_only:1")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if val_tokens is not None:
+        log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -901,6 +1089,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log_compiled_model_summary(log0, base_model, compiled_model)    
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -913,6 +1102,10 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"benchmark_only:{args.benchmark_only} benchmark_steps:{args.benchmark_steps} "
+        f"benchmark_log_every:{args.benchmark_log_every}"
     )
     log0(f"seed:{args.seed}")
 
@@ -966,6 +1159,25 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.benchmark_only:
+        run_strict_benchmark(
+            args=args,
+            model=model,
+            base_model=base_model,
+            optimizers=optimizers,
+            optimizer_muon=optimizer_muon,
+            train_loader=train_loader,
+            grad_accum_steps=grad_accum_steps,
+            grad_scale=grad_scale,
+            distributed=distributed,
+            device=device,
+            world_size=world_size,
+            log0=log0,
+        )
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # -----------------------------
     # MAIN TRAINING LOOP

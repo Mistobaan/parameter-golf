@@ -1,0 +1,9 @@
+RUN_ID=add_flash_attn3 \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=8192 \
+VAL_LOSS_EVERY=0 \
+VAL_BATCH_SIZE=8192 \
+DATA_PATH=./data/datasets/fineweb10B_sp1024/ \
+TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+python3 train_gpt.py
