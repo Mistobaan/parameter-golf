@@ -7,6 +7,55 @@ from pathlib import Path
 import trackio
 import torch
 
+
+TRAIN_ENV_KEYS = (
+    "DATA_PATH",
+    "TOKENIZER_PATH",
+    "SEED",
+    "VAL_BATCH_SIZE",
+    "VAL_LOSS_EVERY",
+    "TRAIN_LOG_EVERY",
+    "ITERATIONS",
+    "WARMDOWN_ITERS",
+    "PROFILE",
+    "WARMUP_STEPS",
+    "TRAIN_SEQ_LEN",
+    "TOKENS_PER_BATCH",
+    "MICROBATCH_STEPS",
+    "MAX_WALLCLOCK_SECONDS",
+    "QK_GAIN_INIT",
+    "VOCAB_SIZE",
+    "NUM_LAYERS",
+    "NUM_KV_HEADS",
+    "NUM_HEADS",
+    "HEAD_DIM",
+    "MODEL_DIM",
+    "MLP_MULT",
+    "TIE_EMBEDDINGS",
+    "ROPE_BASE",
+    "LOGIT_SOFTCAP",
+    "EMBED_LR",
+    "HEAD_LR",
+    "TIED_EMBED_LR",
+    "TIED_EMBED_INIT_STD",
+    "MATRIX_LR",
+    "SCALAR_LR",
+    "MUON_MOMENTUM",
+    "MUON_BACKEND_STEPS",
+    "MUON_MOMENTUM_WARMUP_START",
+    "MUON_MOMENTUM_WARMUP_STEPS",
+    "BETA1",
+    "BETA2",
+    "ADAM_EPS",
+    "GRAD_CLIP_NORM",
+    "CONTROL_TENSOR_NAME_PATTERNS",
+    "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+)
+
+
 def log(msg: str):
     print(f"[{datetime.datetime.now(datetime.UTC).strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -22,13 +71,8 @@ def main():
         # name=run_id,
         auto_log_gpu=ngpus > 0,
         config={
-            "tokens_per_batch": os.environ.get('TOKENS_PER_BATCH'),
-            "minibatch_steps": os.environ.get('MINIBATCH_STEPS'),
-            "vocab_size": os.environ.get('VOCAB_SIZE'),
-            "num_layers": os.environ.get("NUM_LAYERS"),
-            "model_dim": os.environ.get("MODEL_DIM"),
-            "matrix_lr": os.environ.get("MATRIX_LR"),
-            "embed_lr": os.environ.get("EMBED_LR"),
+            key.lower(): os.environ.get(key)
+            for key in TRAIN_ENV_KEYS
         },
         **({"space_id": trackio_space} if trackio_space else {}),
     )

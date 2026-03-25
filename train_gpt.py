@@ -85,7 +85,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     head_dim = int(os.environ.get("HEAD_DIM", 128))
-    model_dim = int(os.environ.get("MODEL_DIM", num_heads * head_dim))
+    # model_dim = int(os.environ.get("MODEL_DIM", num_heads * head_dim))
     mlp_mult = int(os.environ.get("MLP_MULT", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 100_000.0))
@@ -891,7 +891,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
-        model_dim=args.model_dim,
+        model_dim=args.num_heads * args.head_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
@@ -1026,7 +1026,8 @@ def main() -> None:
 
     if args.profile:
         from torch import profiler
-        seq_len = args.train_seq_len
+        
+        log0('profiling:true')
 
         try:
             def zero_grad_all() -> None:
@@ -1064,9 +1065,9 @@ def main() -> None:
                 with profiler.record_function('train_step'):
                     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
                     
-                    
                     zero_grad_all()
                     for step in range(args.iterations):
+                        tokens_per_step = 0
                         if distributed:
                             dist.barrier()
                         torch.cuda.synchronize(device)
@@ -1080,7 +1081,7 @@ def main() -> None:
                             sync_context = nullcontext() if (not distributed or micro_step == grad_accum_steps - 1) else model.no_sync()
 
                             x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
-                            
+                            tokens_per_step += x.numel() 
                             with sync_context: 
                                 with profiler.record_function("forward"):
                                     torch.cuda.nvtx.range_push("forward")
@@ -1133,6 +1134,7 @@ def main() -> None:
                             # f"grad_accumulation_steps:{args.microbatch_steps} "
                             f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                             f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (step+1):.0f}ms "
+                            f"tokens_per_step:{tokens_per_step} "
                             f"step_ms:{wall_ms:.3f} gpu_ms:{gpu_ms:.3f} "
                         )
         except torch.cuda.OutOfMemoryError:
