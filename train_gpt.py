@@ -58,6 +58,9 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    benchmark_only = bool(int(os.environ.get("BENCHMARK_ONLY", "0")))
+    benchmark_steps = int(os.environ.get("BENCHMARK_STEPS", 100))
+    benchmark_log_every = int(os.environ.get("BENCHMARK_LOG_EVERY", 10))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -276,6 +279,190 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def reduce_float(value: float, device: torch.device, op: dist.ReduceOp.RedOpType) -> float:
+    tensor = torch.tensor(value, device=device, dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(tensor, op=op)
+    return float(tensor.item())
+
+
+def log_benchmark_results(
+    log0,
+    device: torch.device,
+    world_size: int,
+    train_batch_tokens: int,
+    benchmark_steps: int,
+    wall_step_ms: list[float],
+    gpu_step_ms: list[float],
+) -> None:
+    if benchmark_steps <= 0:
+        raise ValueError(f"BENCHMARK_STEPS must be positive, got {benchmark_steps}")
+    wall_step_ms_np = np.asarray(wall_step_ms, dtype=np.float64)
+    gpu_step_ms_np = np.asarray(gpu_step_ms, dtype=np.float64)
+    mean_wall_ms = float(wall_step_ms_np.mean())
+    mean_gpu_ms = float(gpu_step_ms_np.mean())
+    global_tokens_per_s = train_batch_tokens / max(mean_wall_ms / 1000.0, 1e-12)
+    local_tokens_per_s = global_tokens_per_s / world_size
+    gpu_busy_ratio_est = min(mean_gpu_ms / max(mean_wall_ms, 1e-12), 1.0)
+
+    mean_wall_ms_global = reduce_float(mean_wall_ms, device, dist.ReduceOp.SUM) / world_size
+    mean_gpu_ms_global = reduce_float(mean_gpu_ms, device, dist.ReduceOp.SUM) / world_size
+    slowest_mean_wall_ms = reduce_float(mean_wall_ms, device, dist.ReduceOp.MAX)
+    fastest_mean_wall_ms = reduce_float(mean_wall_ms, device, dist.ReduceOp.MIN)
+    slowest_global_tokens_per_s = train_batch_tokens / max(slowest_mean_wall_ms / 1000.0, 1e-12)
+    local_tokens_per_s_global = slowest_global_tokens_per_s / world_size
+    gpu_busy_ratio_est_global = min(mean_gpu_ms_global / max(mean_wall_ms_global, 1e-12), 1.0)
+
+    log0(
+        f"benchmark:steps:{benchmark_steps} total_tokens:{train_batch_tokens * benchmark_steps} "
+        f"world_size:{world_size}"
+    )
+    log0(
+        f"benchmark_step_ms:mean:{mean_wall_ms_global:.3f} median:{float(np.median(wall_step_ms_np)):.3f} "
+        f"std:{float(wall_step_ms_np.std()):.3f} min:{float(wall_step_ms_np.min()):.3f} "
+        f"max:{float(wall_step_ms_np.max()):.3f} slowest_rank_mean:{slowest_mean_wall_ms:.3f} "
+        f"fastest_rank_mean:{fastest_mean_wall_ms:.3f}"
+    )
+    log0(
+        f"benchmark_gpu_ms:mean:{mean_gpu_ms_global:.3f} median:{float(np.median(gpu_step_ms_np)):.3f} "
+        f"std:{float(gpu_step_ms_np.std()):.3f} min:{float(gpu_step_ms_np.min()):.3f} "
+        f"max:{float(gpu_step_ms_np.max()):.3f}"
+    )
+    log0(
+        f"benchmark_throughput_tokens_per_s:global:{slowest_global_tokens_per_s:.1f} "
+        f"per_device:{local_tokens_per_s_global:.1f} measured_on:slowest_rank"
+    )
+    log0(
+        f"benchmark_utilization_est:gpu_busy_ratio:{gpu_busy_ratio_est_global:.4f} "
+        f"peak_memory_allocated_mib:{torch.cuda.max_memory_allocated(device) // 1024 // 1024} "
+        f"peak_memory_reserved_mib:{torch.cuda.max_memory_reserved(device) // 1024 // 1024}"
+    )
+
+
+def log_compiled_model_summary(log0, base_model: GPT, compiled_model: nn.Module) -> None:
+    dtype_param_counts: dict[str, int] = {}
+    dtype_tensor_counts: dict[str, int] = {}
+    param_lines: list[str] = []
+    for name, param in base_model.named_parameters():
+        dtype_name = str(param.dtype).removeprefix("torch.")
+        dtype_param_counts[dtype_name] = dtype_param_counts.get(dtype_name, 0) + int(param.numel())
+        dtype_tensor_counts[dtype_name] = dtype_tensor_counts.get(dtype_name, 0) + 1
+        param_lines.append(f"{name}:{tuple(param.shape)}:{dtype_name}")
+
+    dtype_summary = " ".join(
+        f"{dtype}:params={dtype_param_counts[dtype]} tensors={dtype_tensor_counts[dtype]}"
+        for dtype in sorted(dtype_param_counts)
+    )
+    log0(
+        f"compiled_model:type:{type(compiled_model).__name__} "
+        f"module_type:{type(base_model).__name__} device:{next(base_model.parameters()).device}"
+    )
+    log0(
+        f"compiled_model_dims:vocab_size:{base_model.tok_emb.num_embeddings} "
+        f"model_dim:{base_model.tok_emb.embedding_dim} "
+        f"num_layers:{len(base_model.blocks)} encoder_layers:{base_model.num_encoder_layers} "
+        f"decoder_layers:{base_model.num_decoder_layers} num_heads:{base_model.blocks[0].attn.num_heads} "
+        f"num_kv_heads:{base_model.blocks[0].attn.num_kv_heads} "
+        f"head_dim:{base_model.blocks[0].attn.head_dim} "
+        f"mlp_hidden_dim:{base_model.blocks[0].mlp.fc.out_features} "
+        f"tie_embeddings:{base_model.tie_embeddings}"
+    )
+    log0(f"compiled_model_precision:{dtype_summary}")
+    log0(f"compiled_model_params:{' '.join(param_lines)}")
+
+
+def run_strict_benchmark(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    optimizers: list[torch.optim.Optimizer],
+    optimizer_muon: Muon,
+    train_loader,
+    grad_accum_steps: int,
+    grad_scale: float,
+    distributed: bool,
+    device: torch.device,
+    world_size: int,
+    log0,
+) -> None:
+    if args.benchmark_steps <= 0:
+        raise ValueError(f"BENCHMARK_STEPS must be positive, got {args.benchmark_steps}")
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    model.train()
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    wall_step_ms: list[float] = []
+    gpu_step_ms: list[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    for step in range(args.benchmark_steps):
+        zero_grad_all()
+        if distributed:
+            dist.barrier()
+        torch.cuda.synchronize(device)
+        wall_t0 = time.perf_counter()
+        start_event.record()
+
+        train_loss = torch.zeros((), device=device)
+        for micro_step in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
+            train_loss += loss.detach()
+            (loss * grad_scale).backward()
+        train_loss /= grad_accum_steps
+
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = args.muon_momentum
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"]
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        zero_grad_all()
+
+        end_event.record()
+        torch.cuda.synchronize(device)
+        wall_ms = 1000.0 * (time.perf_counter() - wall_t0)
+        gpu_ms = float(start_event.elapsed_time(end_event))
+        wall_step_ms.append(wall_ms)
+        gpu_step_ms.append(gpu_ms)
+
+        should_log = (
+            args.benchmark_log_every > 0
+            and ((step + 1) <= 5 or (step + 1) % args.benchmark_log_every == 0 or (step + 1) == args.benchmark_steps)
+        )
+        if should_log:
+            step_global_tokens_per_s = args.train_batch_tokens / max(wall_ms / 1000.0, 1e-12)
+            log0(
+                f"benchmark_step:{step + 1}/{args.benchmark_steps} train_loss:{train_loss.item():.4f} "
+                f"step_ms:{wall_ms:.3f} gpu_ms:{gpu_ms:.3f} "
+                f"tokens_per_s_global:{step_global_tokens_per_s:.1f}"
+            )
+
+    if distributed:
+        model.require_backward_grad_sync = True
+    log_benchmark_results(
+        log0=log0,
+        device=device,
+        world_size=world_size,
+        train_batch_tokens=args.train_batch_tokens,
+        benchmark_steps=args.benchmark_steps,
+        wall_step_ms=wall_step_ms,
+        gpu_step_ms=gpu_step_ms,
+    )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -802,22 +989,30 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    val_tokens = None
+    base_bytes_lut = None
+    has_leading_space_lut = None
+    is_boundary_token_lut = None
+    if not args.benchmark_only:
+        if not args.tokenizer_path.endswith(".model"):
+            raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
+        )
+        log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    else:
+        log0("val_bpb:disabled benchmark_only:1")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    if val_tokens is not None:
+        log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -894,6 +1089,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log_compiled_model_summary(log0, base_model, compiled_model)
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -906,6 +1102,10 @@ def main() -> None:
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"benchmark_only:{args.benchmark_only} benchmark_steps:{args.benchmark_steps} "
+        f"benchmark_log_every:{args.benchmark_log_every}"
     )
     log0(f"seed:{args.seed}")
 
@@ -959,6 +1159,25 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.benchmark_only:
+        run_strict_benchmark(
+            args=args,
+            model=model,
+            base_model=base_model,
+            optimizers=optimizers,
+            optimizer_muon=optimizer_muon,
+            train_loader=train_loader,
+            grad_accum_steps=grad_accum_steps,
+            grad_scale=grad_scale,
+            distributed=distributed,
+            device=device,
+            world_size=world_size,
+            log0=log0,
+        )
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # -----------------------------
     # MAIN TRAINING LOOP
