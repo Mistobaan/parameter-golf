@@ -12,11 +12,13 @@ import io
 import math
 import os
 import random
+import signal
 import subprocess
 import sys
 import time
 import uuid
 import zlib
+import atexit
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +30,16 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from flash_attn_interface import flash_attn_func, _flash_attn_forward
+
+from contextlib import nullcontext
+
+record_function = lambda *_: nullcontext()
+profile = bool(os.environ.get("PROFILE", False))
+if profile:
+    import torch.profiler
+    record_function  = torch.profiler.record_function
+
+
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -55,9 +67,15 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    profile = bool(os.environ.get("PROFILE", False))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 10))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288 * 16))
+    
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
+    # number of tokens for each batch. this must be a multiple of seq_len
+    tokens_per_batch = int(os.environ.get("TOKENS_PER_BATCH", train_seq_len * 8))
+    # number of batches to process before computing the gradient
+    microbatch_steps = int(os.environ.get("MICROBATCH_STEPS", 8)) 
+    
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -486,8 +504,11 @@ class DistributedTokenLoader:
         self.device = device
         self.stream = TokenStream(pattern)
 
-    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+    def batch_tokens_per_node(self, global_tokens:int, grad_accum_steps:int)->int:
+        return global_tokens // (self.world_size * grad_accum_steps)
+    
+    def next_batch(self, microbatch_steps:int, tokens_per_batch:int, seq_len:int) -> tuple[Tensor, Tensor]:
+        local_tokens = microbatch_steps * tokens_per_batch
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
@@ -587,8 +608,8 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, num_kv_heads * head_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        # self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        # self.k_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads, ), qk_gain_init, dtype=torch.float32))
+        self.k_gain = nn.Parameter(torch.full((num_heads, ), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -602,8 +623,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        # q *= self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        # k *= self.k_gain.to(dtype=k.dtype)[None, None, :, None]
+        q *= self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+        k *= self.k_gain.to(dtype=k.dtype)[None, None, :, None]
         # dtype = torch.float8_e4m3fn
         # q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
         y = flash_attn_func(q, k, v, causal=True)
@@ -629,6 +650,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(
         self,
+        id: int, 
         dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -637,6 +659,7 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
+        self.id = id
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -646,11 +669,13 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        with record_function(f"block_{self.id:02d}.attn"):
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        with record_function(f"block_{self.id:02d}.mlp"):
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -683,6 +708,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 Block(
+                    i,
                     model_dim,
                     num_heads,
                     num_kv_heads,
@@ -791,6 +817,36 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+    def _handle_signals():
+        shutdown_started = False
+
+        def shutdown_dist() -> None:
+            nonlocal shutdown_started
+            if shutdown_started or not distributed:
+                return
+            if not dist.is_available() or not dist.is_initialized():
+                return
+            shutdown_started = True
+            try:
+                log0("shutting down torch.distributed process group")
+                dist.destroy_process_group()
+            except Exception as exc:
+                log0(f"err: torch.distributed shutdown failed: {exc}")
+
+        def handle_signal(signum, _frame) -> None:
+            signame = signal.Signals(signum).name
+            log0(f"received {signame}, shutting down")
+            shutdown_dist()
+            raise KeyboardInterrupt(f"Received {signame}")
+
+        if distributed:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(signum, handle_signal)
+            atexit.register(shutdown_dist)
+        return shutdown_dist
+    
+    handle_signals_cleanup = _handle_signals()
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -911,8 +967,9 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    
     log0(
-        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"tokens_per_batch:{args.tokens_per_batch} microbatch_steps:{args.microbatch_steps} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
@@ -921,8 +978,6 @@ def main() -> None:
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
-
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -940,10 +995,11 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
+    
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -952,7 +1008,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -967,12 +1023,128 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    if args.profile:
+        from torch import profiler
+        seq_len = args.train_seq_len
+
+        try:
+            def zero_grad_all() -> None:
+                for opt in optimizers:
+                    opt.zero_grad(set_to_none=True)
+
+            model.train()
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            def trace_ready_callback(prof: torch.profiler.profile):
+                log0( prof.key_averages().table( 
+                                                sort_by="self_cuda_time_total", 
+                                                row_limit=50, 
+                                            ))
+                prof.export_stacks('./cuda.profile', metric='self_cuda_time_total')
+                prof.export_stacks('./cpu.profile', metric='self_cpu_time_total')
+                prof.export_chrome_trace(f"train-gpt-{rank}-chrome-trace-seq-len-{args.tokens_per_batch}.json.gz")        
+            
+            training_time_ms = 0 
+            with profiler.profile( 
+                                activities=[
+                                        profiler.ProfilerActivity.CPU, 
+                                        profiler.ProfilerActivity.CUDA
+                                ], 
+                                record_shapes=True, # record tensor shapes 
+                                profile_memory=True, # track GPU memory usage per op 
+                                with_stack=True, # enable stack tracing
+                                with_flops=True, # capture Flops Counter 
+                                acc_events=True, # accumulate events for each cycle
+                                on_trace_ready=trace_ready_callback
+            ) as prof:
+                with profiler.record_function('train_step'):
+                    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+                    
+                    
+                    zero_grad_all()
+                    for step in range(args.iterations):
+                        if distributed:
+                            dist.barrier()
+                        torch.cuda.synchronize(device)
+                        wall_t0 = time.perf_counter()
+                        start_event.record()
+
+                        train_loss = torch.zeros((), device=device)
+                        
+                        for micro_step in range(grad_accum_steps):
+
+                            sync_context = nullcontext() if (not distributed or micro_step == grad_accum_steps - 1) else model.no_sync()
+
+                            x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
+                            
+                            with sync_context: 
+                                with profiler.record_function("forward"):
+                                    torch.cuda.nvtx.range_push("forward")
+                                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                                        loss = model(x, y)
+                                    torch.cuda.nvtx.range_pop()
+                            
+                            torch.cuda.nvtx.range_push("backward")
+                            train_loss += loss.detach()
+                            loss.backward()
+                            torch.cuda.nvtx.range_pop()
+                            
+                        train_loss *= grad_scale
+
+                        for p in base_model.parameters():
+                            if p.grad is not None:
+                                p.grad.mul_(grad_scale)
+                                
+                        for group in optimizer_muon.param_groups:
+                            group["momentum"] = args.muon_momentum
+
+                        for opt in optimizers:
+                            for group in opt.param_groups:
+                                group["lr"] = group["base_lr"]
+
+                        if args.grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+
+                        # run optimizer only after accumulating 8 backward passes
+                        for opt in optimizers:
+                            torch.cuda.nvtx.range_push(f"optimizer:{type(opt)}:step")
+                            opt.step()
+                            torch.cuda.nvtx.range_pop()
+
+                        zero_grad_all()
+                        
+                        end_event.record()
+                        torch.cuda.synchronize(device)
+
+                        
+                        wall_ms = 1000.0 * (time.perf_counter() - wall_t0)
+                        gpu_ms = float(start_event.elapsed_time(end_event))
+                        prof.step()
+                        
+                        training_time_ms = 1000.0 * (time.perf_counter() - wall_t0)
+                        
+                        log0(
+                            # f"profiling:true "
+                            # f"tokens_per_batch:{args.tokens_per_batch} "
+                            # f"grad_accumulation_steps:{args.microbatch_steps} "
+                            f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                            f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (step+1):.0f}ms "
+                            f"step_ms:{wall_ms:.3f} gpu_ms:{gpu_ms:.3f} "
+                        )
+        except torch.cuda.OutOfMemoryError:
+            log0('oom:true ')
+        
+        return
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+   
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1020,7 +1192,7 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1127,8 +1299,7 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    if distributed:
-        dist.destroy_process_group()
+    handle_signals_cleanup()
 
 
 if __name__ == "__main__":
