@@ -55,7 +55,7 @@ class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -238,7 +238,19 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
-def eval_val(
+def load_validation_bytes(pattern: str, seq_len: int) -> Tensor:
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    tokens = torch.cat([load_byte_shard(file) for file in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    if usable <= 0:
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+    return tokens[: usable + 1]
+
+
+def eval_val_tokens(
     args: Hyperparameters,
     model: nn.Module,
     rank: int,
@@ -298,6 +310,53 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_bytes(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+) -> tuple[float, float]:
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    model.train()
+    return float(val_loss.item()), float(val_loss.item() / math.log(2.0))
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -466,13 +525,33 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
+def load_byte_shard(file: Path) -> Tensor:
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    #token_bytes = np.dtype(np.uint8).itemsize
+    token_bytes = np.dtype("<u2").itemsize
+    header = np.fromfile(file, dtype="<i4", count=256)
+    # SHARD HEADER INTS & SHARD_MAGIC
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Unexpected shard header for {file}")
+    num_tokens = int(header[2])
+    expected_size = header_bytes + num_tokens * token_bytes
+    if file.stat().st_size != expected_size:
+        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    tokens_np = np.fromfile(file, dtype=np.uint8, count=num_tokens, offset=header_bytes)
+    if tokens_np.size != num_tokens:
+        raise ValueError(f"Short read for {file}")
+    return torch.from_numpy(tokens_np.astype(np.uint8, copy=False))
+
+
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, load_shard=load_data_shard, token_bytes: int = np.dtype("<u2").itemsize):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.load_shard = load_shard
+        self.token_bytes = token_bytes
         self.file_idx = 0
         self.shard_loads = 0
         self.shard_load_time_s = 0.0
@@ -482,10 +561,10 @@ class TokenStream:
 
     def _load_file(self, file: Path) -> Tensor:
         t0 = time.perf_counter()
-        tokens = load_data_shard(file)
+        tokens = self.load_shard(file)
         self.shard_loads += 1
         self.shard_load_time_s += time.perf_counter() - t0
-        self.shard_bytes += int(tokens.numel()) * np.dtype("<u2").itemsize
+        self.shard_bytes += int(tokens.numel()) * self.token_bytes
         return tokens
 
     def _advance_file(self) -> None:
@@ -529,12 +608,14 @@ class DistributedTokenLoader:
         world_size: int,
         device: torch.device,
         pin_memory: bool = True,
+        load_shard=load_data_shard,
+        token_bytes: int = np.dtype("<u2").itemsize,
     ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
         self.pin_memory = pin_memory
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, load_shard=load_shard, token_bytes=token_bytes)
         self.host_batch_time_s = 0.0
         self.h2d_submit_time_s = 0.0
         self.batches = 0
@@ -575,6 +656,42 @@ class DistributedTokenLoader:
         self.batches = 0
         self.local_tokens = 0
         return stats
+
+
+def build_token_loader(
+    pattern: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    pin_memory: bool = True,
+) -> DistributedTokenLoader:
+    return DistributedTokenLoader(
+        pattern,
+        rank,
+        world_size,
+        device,
+        pin_memory=pin_memory,
+        load_shard=load_data_shard,
+        token_bytes=np.dtype("<u2").itemsize,
+    )
+
+
+def build_byte_loader(
+    pattern: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    pin_memory: bool = True,
+) -> DistributedTokenLoader:
+    return DistributedTokenLoader(
+        pattern,
+        rank,
+        world_size,
+        device,
+        pin_memory=pin_memory,
+        load_shard=load_byte_shard,
+        token_bytes=np.dtype(np.uint8).itemsize,
+    )
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -926,20 +1043,55 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    if args.tokenizer_path is None:
+        if args.vocab_size < 256:
+            raise ValueError(f"Byte-mode datasets require VOCAB_SIZE >= 256, got {args.vocab_size}")
+        val_tokens = load_validation_bytes(args.val_files, args.train_seq_len)
+        make_train_loader = build_byte_loader
+
+        def run_validation() -> tuple[float, float]:
+            return eval_val_bytes(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+            )
+
+        log0("val_bpb:enabled tokenizer_kind=bytes tokenizer_path=None")
+    else:
+        if not args.tokenizer_path.endswith(".model"):
+            raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
+        )
+        make_train_loader = build_token_loader
+
+        def run_validation() -> tuple[float, float]:
+            return eval_val_tokens(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+
+        log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(
         f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files} "
         f"pin_memory:{args.loader_pin_memory}"
@@ -1061,7 +1213,7 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
-        train_loader = DistributedTokenLoader(
+        train_loader = make_train_loader(
             args.train_files,
             rank,
             world_size,
@@ -1137,7 +1289,7 @@ def main() -> None:
                                 on_trace_ready=trace_ready_callback
             ) as prof:
                 with profiler.record_function('train_step'):
-                    train_loader = DistributedTokenLoader(
+                    train_loader = make_train_loader(
                         args.train_files,
                         rank,
                         world_size,
@@ -1259,7 +1411,7 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(
+    train_loader = make_train_loader(
         args.train_files,
         rank,
         world_size,
@@ -1280,18 +1432,7 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
+            val_loss, val_bpb = run_validation()
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1414,18 +1555,7 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    q_val_loss, q_val_bpb = run_validation()
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
