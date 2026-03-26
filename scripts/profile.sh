@@ -5,19 +5,21 @@ export EXPERIMENT_ID=base_gpt_opt
 # train_gpt.py generates a UUID when RUN_ID is unset; mirror that behavior here.
 # when using trackio let's use trackio autogen run id
 # export RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-# export PROFILE=1
+export PROFILE=1
+export RUN_ID="profiler-loader_pin_memory_on_batch_524288"
+export LOADER_PIN_MEMORY=1
+export WARMUP_STEPS=20
+export ITERATIONS=20
+export MICROBATCH_STEPS=1
 export DATA_PATH=./data/datasets/fineweb10B_sp1024
 export TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model
 export SEED=1337
 export VAL_BATCH_SIZE=524288
 export VAL_LOSS_EVERY=1000
 export TRAIN_LOG_EVERY=100
-export ITERATIONS=500
 export WARMDOWN_ITERS=3500
-export WARMUP_STEPS=20
 export TRAIN_SEQ_LEN=2048
-export TOKENS_PER_BATCH=8192
-export MICROBATCH_STEPS=8
+export TOKENS_PER_BATCH=524288
 export MAX_WALLCLOCK_SECONDS=600.0
 export QK_GAIN_INIT=1.5
 export VOCAB_SIZE=1024

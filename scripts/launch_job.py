@@ -63,12 +63,12 @@ def log(msg: str):
 def main():
     trackio_space = os.environ.get("TRACKIO_SPACE_ID")
     experiment = os.environ.get('EXPERIMENT_ID')
-    
+    run_id = os.environ.get("RUN_ID", None) 
     ngpus = torch.cuda.device_count()
     
     run = trackio.init(
         project="parameter-golf",
-        # name=run_id,
+        name=run_id,
         auto_log_gpu=ngpus > 0,
         config={
             key.lower(): os.environ.get(key)

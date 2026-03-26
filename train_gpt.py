@@ -75,6 +75,7 @@ class Hyperparameters:
     tokens_per_batch = int(os.environ.get("TOKENS_PER_BATCH", train_seq_len * 8))
     # number of batches to process before computing the gradient
     microbatch_steps = int(os.environ.get("MICROBATCH_STEPS", 8))
+    loader_pin_memory = bool(int(os.environ.get("LOADER_PIN_MEMORY", "1")))
 
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -473,12 +474,23 @@ class TokenStream:
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
-        self.tokens = load_data_shard(self.files[0])
+        self.shard_loads = 0
+        self.shard_load_time_s = 0.0
+        self.shard_bytes = 0
+        self.tokens = self._load_file(self.files[0])
         self.pos = 0
+
+    def _load_file(self, file: Path) -> Tensor:
+        t0 = time.perf_counter()
+        tokens = load_data_shard(file)
+        self.shard_loads += 1
+        self.shard_load_time_s += time.perf_counter() - t0
+        self.shard_bytes += int(tokens.numel()) * np.dtype("<u2").itemsize
+        return tokens
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.tokens = self._load_file(self.files[self.file_idx])
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
@@ -495,25 +507,75 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
+    def pop_stats(self) -> dict[str, float | int]:
+        stats = {
+            "shard_loads": self.shard_loads,
+            "shard_load_time_s": self.shard_load_time_s,
+            "shard_bytes": self.shard_bytes,
+        }
+        self.shard_loads = 0
+        self.shard_load_time_s = 0.0
+        self.shard_bytes = 0
+        return stats
+
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(
+        self,
+        pattern: str,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        pin_memory: bool = True,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.pin_memory = pin_memory
         self.stream = TokenStream(pattern)
+        self.host_batch_time_s = 0.0
+        self.h2d_submit_time_s = 0.0
+        self.batches = 0
+        self.local_tokens = 0
 
     def next_batch(self, microbatch_steps:int, tokens_per_batch:int, seq_len:int) -> tuple[Tensor, Tensor]:
         local_tokens = microbatch_steps * tokens_per_batch
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
-        x = local[:-1].reshape(-1, seq_len)
-        y = local[1:].reshape(-1, seq_len)
-        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+        host_t0 = time.perf_counter()
+        with record_function("data.host_batch"):
+            chunk = self.stream.take(per_rank_span * self.world_size)
+            start = self.rank * per_rank_span
+            local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+            if self.pin_memory:
+                local = local.pin_memory()
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+        self.host_batch_time_s += time.perf_counter() - host_t0
+
+        h2d_t0 = time.perf_counter()
+        with record_function("data.h2d"):
+            x = x.to(self.device, non_blocking=self.pin_memory)
+            y = y.to(self.device, non_blocking=self.pin_memory)
+        self.h2d_submit_time_s += time.perf_counter() - h2d_t0
+        self.batches += 1
+        self.local_tokens += int(x.numel())
+        return x, y
+
+    def pop_stats(self) -> dict[str, float | int]:
+        stats = {
+            "host_batch_time_s": self.host_batch_time_s,
+            "h2d_submit_time_s": self.h2d_submit_time_s,
+            "batches": self.batches,
+            "local_tokens": self.local_tokens,
+        }
+        stats.update(self.stream.pop_stats())
+        self.host_batch_time_s = 0.0
+        self.h2d_submit_time_s = 0.0
+        self.batches = 0
+        self.local_tokens = 0
+        return stats
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -879,7 +941,10 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(
+        f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files} "
+        f"pin_memory:{args.loader_pin_memory}"
+    )
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
@@ -997,7 +1062,13 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(
+            args.train_files,
+            rank,
+            world_size,
+            device,
+            pin_memory=args.loader_pin_memory,
+        )
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
@@ -1048,6 +1119,12 @@ def main() -> None:
                 prof.export_chrome_trace(f"train-gpt-{rank}-chrome-trace-seq-len-{args.tokens_per_batch}.json.gz")
 
             training_time_ms = 0
+            total_profile_tokens = 0
+            total_profile_gpu_ms = 0.0
+            total_profile_loader_host_ms = 0.0
+            total_profile_h2d_submit_ms = 0.0
+            total_profile_shard_io_ms = 0.0
+            total_profile_shard_loads = 0
             with profiler.profile(
                                 activities=[
                                         profiler.ProfilerActivity.CPU,
@@ -1061,7 +1138,13 @@ def main() -> None:
                                 on_trace_ready=trace_ready_callback
             ) as prof:
                 with profiler.record_function('train_step'):
-                    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+                    train_loader = DistributedTokenLoader(
+                        args.train_files,
+                        rank,
+                        world_size,
+                        device,
+                        pin_memory=args.loader_pin_memory,
+                    )
 
                     zero_grad_all()
                     for step in range(args.iterations):
@@ -1078,7 +1161,12 @@ def main() -> None:
                             sync = (micro_step == grad_accum_steps - 1)
                             ctx = nullcontext() if (not distributed or sync) else model.no_sync()
 
-                            x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
+                            with profiler.record_function("data_loading"):
+                                x, y = train_loader.next_batch(
+                                    args.microbatch_steps,
+                                    args.tokens_per_batch,
+                                    args.train_seq_len,
+                                )
                             tokens_per_step += x.numel()
 
                             with ctx, profiler.record_function("forward"):
@@ -1118,19 +1206,51 @@ def main() -> None:
 
                         wall_ms = 1000.0 * (time.perf_counter() - wall_t0)
                         gpu_ms = float(start_event.elapsed_time(end_event))
+                        loader_stats = train_loader.pop_stats()
+                        loader_host_ms = 1000.0 * float(loader_stats["host_batch_time_s"])
+                        h2d_submit_ms = 1000.0 * float(loader_stats["h2d_submit_time_s"])
+                        shard_io_ms = 1000.0 * float(loader_stats["shard_load_time_s"])
+                        shard_loads = int(loader_stats["shard_loads"])
+                        shard_mb = float(loader_stats["shard_bytes"]) / (1024.0 * 1024.0)
+                        global_tokens_per_step = tokens_per_step * world_size
+                        total_profile_tokens += global_tokens_per_step
+                        total_profile_gpu_ms += gpu_ms
+                        total_profile_loader_host_ms += loader_host_ms
+                        total_profile_h2d_submit_ms += h2d_submit_ms
+                        total_profile_shard_io_ms += shard_io_ms
+                        total_profile_shard_loads += shard_loads
                         prof.step()
 
-                        training_time_ms = 1000.0 * (time.perf_counter() - wall_t0)
+                        training_time_ms += wall_ms
+                        wall_tok_s = global_tokens_per_step * 1000.0 / max(wall_ms, 1e-9)
+                        avg_wall_tok_s = total_profile_tokens * 1000.0 / max(training_time_ms, 1e-9)
+                        gpu_tok_s = global_tokens_per_step * 1000.0 / max(gpu_ms, 1e-9)
+                        avg_gpu_tok_s = total_profile_tokens * 1000.0 / max(total_profile_gpu_ms, 1e-9)
+                        loader_wait_ms = loader_host_ms + h2d_submit_ms
+                        loader_pct = 100.0 * loader_wait_ms / max(wall_ms, 1e-9)
+                        shard_mb_s = shard_mb * 1000.0 / max(shard_io_ms, 1e-9) if shard_loads > 0 else 0.0
 
                         log0(
-                            # f"profiling:true "
-                            # f"tokens_per_batch:{args.tokens_per_batch} "
-                            # f"grad_accumulation_steps:{args.microbatch_steps} "
-                            f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                            f"step:{step + 1}/{args.iterations} train_loss:{train_loss.item():.4f} "
                             f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (step+1):.0f}ms "
-                            f"tokens_per_step:{tokens_per_step} "
+                            f"local_tokens:{tokens_per_step} global_tokens:{global_tokens_per_step} "
                             f"step_ms:{wall_ms:.3f} gpu_ms:{gpu_ms:.3f} "
+                            f"tok_s:{wall_tok_s:.0f} avg_tok_s:{avg_wall_tok_s:.0f} "
+                            f"gpu_tok_s:{gpu_tok_s:.0f} avg_gpu_tok_s:{avg_gpu_tok_s:.0f} "
+                            f"loader_ms:{loader_wait_ms:.3f} loader_pct:{loader_pct:.1f}% "
+                            f"host_batch_ms:{loader_host_ms:.3f} h2d_submit_ms:{h2d_submit_ms:.3f} "
+                            f"shard_io_ms:{shard_io_ms:.3f} shard_loads:{shard_loads} shard_mb:{shard_mb:.2f} "
+                            f"shard_mb_s:{shard_mb_s:.1f}"
                         )
+            log0(
+                f"profile_summary: tokens:{total_profile_tokens} train_time:{training_time_ms:.0f}ms "
+                f"avg_tok_s:{total_profile_tokens * 1000.0 / max(training_time_ms, 1e-9):.0f} "
+                f"avg_gpu_tok_s:{total_profile_tokens * 1000.0 / max(total_profile_gpu_ms, 1e-9):.0f} "
+                f"avg_loader_ms:{(total_profile_loader_host_ms + total_profile_h2d_submit_ms) / max(args.iterations, 1):.3f} "
+                f"avg_host_batch_ms:{total_profile_loader_host_ms / max(args.iterations, 1):.3f} "
+                f"avg_h2d_submit_ms:{total_profile_h2d_submit_ms / max(args.iterations, 1):.3f} "
+                f"total_shard_io_ms:{total_profile_shard_io_ms:.3f} shard_loads:{total_profile_shard_loads}"
+            )
         except torch.cuda.OutOfMemoryError:
             log0('oom:true ')
 
@@ -1144,7 +1264,13 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_loader = DistributedTokenLoader(
+        args.train_files,
+        rank,
+        world_size,
+        device,
+        pin_memory=args.loader_pin_memory,
+    )
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
