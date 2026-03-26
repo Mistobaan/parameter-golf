@@ -540,9 +540,8 @@ class DistributedTokenLoader:
         self.batches = 0
         self.local_tokens = 0
 
-    def next_batch(self, microbatch_steps:int, tokens_per_batch:int, seq_len:int) -> tuple[Tensor, Tensor]:
-        local_tokens = microbatch_steps * tokens_per_batch
-        per_rank_span = local_tokens + 1
+    def next_batch(self, tokens_per_batch:int, seq_len:int) -> tuple[Tensor, Tensor]:
+        per_rank_span = tokens_per_batch + 1
         host_t0 = time.perf_counter()
         with record_function("data.host_batch"):
             chunk = self.stream.take(per_rank_span * self.world_size)
@@ -669,7 +668,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads, ), qk_gain_init, dtype=torch.float32))
-        self.k_gain = nn.Parameter(torch.full((num_heads, ), qk_gain_init, dtype=torch.float32))
+        self.k_gain = nn.Parameter(torch.full((num_kv_heads, ), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1077,7 +1076,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
+                x, y = train_loader.next_batch(args.tokens_per_batch, args.train_seq_len)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1162,11 +1161,7 @@ def main() -> None:
                             ctx = nullcontext() if (not distributed or sync) else model.no_sync()
 
                             with profiler.record_function("data_loading"):
-                                x, y = train_loader.next_batch(
-                                    args.microbatch_steps,
-                                    args.tokens_per_batch,
-                                    args.train_seq_len,
-                                )
+                                x, y = train_loader.next_batch(args.tokens_per_batch, args.train_seq_len)
                             tokens_per_step += x.numel()
 
                             with ctx, profiler.record_function("forward"):
@@ -1320,7 +1315,7 @@ def main() -> None:
             sync = (micro_step == grad_accum_steps - 1)
             ctx = nullcontext() if (not distributed or sync) else model.no_sync()
 
-            x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
+            x, y = train_loader.next_batch(args.tokens_per_batch, args.train_seq_len)
             with ctx, torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1355,12 +1350,9 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms " + " ".join(f"{type(opt).__name__.lower().split('.')[-1].strip()}:{group["lr"]:.04f}" for opt in optimizers for group in opt.param_groups)
             )
 
-            for opt in optimizers:
-                for group in opt.param_groups:
-                    log0(f"opt:{type(opt)} lr:{group["lr"]}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

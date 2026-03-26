@@ -1,66 +1,59 @@
-# Data Workflows
+---
+license: apache-2.0
+language:
+- en
+pretty_name: FineWeb 10B Bytes
+task_categories:
+- text-generation
+---
 
-This directory contains the dataset download helpers and export scripts used for the challenge.
+# FineWeb 10B Bytes
 
-Canonical local layout:
-- `data/datasets/<dataset_name>/`
-- `data/tokenizers/`
-- `data/manifest.json`
-- `data/docs_selected.jsonl`
-- `data/docs_selected.source_manifest.json`
+This repository contains training shards for byte-level language model pretraining.
 
-## Downloading Published Data
+The dataset format is the same format used by [openai/parameter-golf](https://github.com/openai/parameter-golf), the OpenAI Model Craft Challenge repository for training compact language models and evaluating them on FineWeb in bits per byte. In that repository, evaluation is described as tokenizer-agnostic and based on compression performance on the FineWeb validation set.  [oai_citation:0‡GitHub](https://github.com/openai/parameter-golf)
 
-Download the cached FineWeb export for a tokenizer variant with:
+## Origin
 
-```bash
-python3 data/cached_challenge_fineweb.py --variant sp1024
-```
+These byte shards were generated using the data conversion approach from [openai/parameter-golf Pull Request #705](https://github.com/openai/parameter-golf/pull/705), authored by GitHub user [`seanward`](https://github.com/seanward). That PR is titled **“Byte-Level Tokenizer-Free Transformer”** and explicitly includes a conversion script named `convert_to_bytes.py`, described there as **“Data conversion (sp1024 → raw bytes)”**.  [oai_citation:1‡GitHub](https://github.com/openai/parameter-golf/pull/705)
 
-This populates `./data/datasets/fineweb10B_sp1024/` and `./data/tokenizers/`.
-By default it downloads the full validation split and 8B training tokens (80 train shards).
+## Contents
 
-To fetch more training shards, pass `--train-shards`:
+This repository stores shard files such as:
 
-```bash
-python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 180
-```
+- `fineweb_train_000000.bin`
+- `fineweb_train_000001.bin`
+- `fineweb_train_000002.bin`
 
-The downloader is manifest-driven and can fetch only a prefix of train shards from a larger published export. With the current shard size of `100_000_000` tokens, `10B` retokenized training tokens is `100` train shards:
+and so on.
 
-```bash
-MATCHED_FINEWEB_REPO_ID=your-hf-username/your-dataset-repo \
-MATCHED_FINEWEB_REMOTE_ROOT_PREFIX=your_50B_export_root \
-python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 100
-```
+## Dataset format
 
-Validation is always downloaded in full from the fixed `fineweb_val_*` split. Training on the first `N` train shards means training on the prefix of the same frozen shuffled export, so the data order stays aligned with the baseline for that tokenizer family.
+The `.bin` shards follow the same binary training-data convention used for byte-level experiments in `parameter-golf`.
 
-The default published repo is `willdepueoai/parameter-golf`, with the export rooted under the repo subdirectory `datasets/`.
+At a high level:
 
-## Rebuilding Tokenizers From Published Docs
+- data is represented as raw UTF-8 bytes
+- the byte vocabulary size is 256
+- shards are intended for training tokenizer-free / byte-level models
+- the data layout is meant for efficient streaming during pretraining
 
-To retrain a tokenizer or re-export shards from exactly the same selected documents, run the standalone retokenizer against the published docs cache:
+The associated PR #705 describes the model as operating directly on raw UTF-8 bytes with `vocab=256`, and states that it uses raw byte input without BPE or SentencePiece.  [oai_citation:2‡GitHub](https://github.com/openai/parameter-golf/pull/705)
 
-```bash
-python3 data/download_hf_docs_and_tokenize.py \
-  --repo-id your-hf-username/your-dataset-repo \
-  --remote-root your_50B_export_root \
-  --output-root /tmp/my_custom_tokenizer_export \
-  --tokenizer-config ./data/tokenizer_specs.json
-```
+## Provenance
 
-The sidecar `docs_selected.source_manifest.json` includes `docs_sha256`, so users can verify they are rebuilding from the exact same document list and order as the baseline export.
+Source data is derived from FineWeb preprocessing workflows associated with byte-level training experiments for `parameter-golf`.
 
-## Useful Knobs
+This repository republishes the resulting training shards only. It does **not** bundle the training code itself; for the original training setup, conversion logic, and experiment context, see:
 
-For CPU-heavy exports, useful knobs are:
+- `openai/parameter-golf`
+- PR #705 by `seanward` (“Byte-Level Tokenizer-Free Transformer”)  [oai_citation:3‡GitHub](https://github.com/openai/parameter-golf)
 
-```bash
-MATCHED_FINEWEB_SP_BATCH_SIZE=2048
-MATCHED_FINEWEB_TOKENIZER_THREADS=16
-MATCHED_FINEWEB_TIKTOKEN_THREADS=16
-MATCHED_FINEWEB_GPT2_DECODE_BATCH_SIZE=512
-```
+## Intended use
 
-These control batched tokenizer encoding during shard export, tokenizer thread count, tiktoken thread count, and batched GPT-2 decode for the blobstore docs-cache path.
+This dataset is intended for:
+
+- byte-level language model pretraining
+- tokenizer-free training experiments
+- reproducing or adapting `parameter-golf`-style data pipelines
+- benchmarking compact models on byte-level objectives
