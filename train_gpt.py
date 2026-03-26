@@ -69,13 +69,13 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     profile = bool(os.environ.get("PROFILE", False))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 10))
-    
+
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     # number of tokens for each batch. this must be a multiple of seq_len
     tokens_per_batch = int(os.environ.get("TOKENS_PER_BATCH", train_seq_len * 8))
     # number of batches to process before computing the gradient
-    microbatch_steps = int(os.environ.get("MICROBATCH_STEPS", 8)) 
-    
+    microbatch_steps = int(os.environ.get("MICROBATCH_STEPS", 8))
+
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -108,9 +108,9 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
-# 
+#
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
@@ -190,7 +190,7 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -305,6 +305,7 @@ def eval_val(
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
 # Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+ARTIFACT_SIZE_LIMIT_BYTES = 16_000_000
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -444,7 +445,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -504,9 +505,6 @@ class DistributedTokenLoader:
         self.device = device
         self.stream = TokenStream(pattern)
 
-    def batch_tokens_per_node(self, global_tokens:int, grad_accum_steps:int)->int:
-        return global_tokens // (self.world_size * grad_accum_steps)
-    
     def next_batch(self, microbatch_steps:int, tokens_per_batch:int, seq_len:int) -> tuple[Tensor, Tensor]:
         local_tokens = microbatch_steps * tokens_per_batch
         per_rank_span = local_tokens + 1
@@ -551,7 +549,7 @@ class Rotary(nn.Module):
         super().__init__()
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -569,7 +567,7 @@ class Rotary(nn.Module):
             # add batch and head dims for later broadcasting over seqlen and head_dim
             self._cos_cached = freqs.cos()[None, :, None, :]
             self._sin_cached = freqs.sin()[None, :, None, :]
-            
+
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
@@ -650,7 +648,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(
         self,
-        id: int, 
+        id: int,
         dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -782,7 +780,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = args.microbatch_steps
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -845,7 +843,7 @@ def main() -> None:
                 signal.signal(signum, handle_signal)
             atexit.register(shutdown_dist)
         return shutdown_dist
-    
+
     handle_signals_cleanup = _handle_signals()
 
     log0(code, console=False)
@@ -967,7 +965,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    
+
     log0(
         f"tokens_per_batch:{args.tokens_per_batch} microbatch_steps:{args.microbatch_steps} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -995,7 +993,7 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-    
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -1026,7 +1024,7 @@ def main() -> None:
 
     if args.profile:
         from torch import profiler
-        
+
         log0('profiling:true')
 
         try:
@@ -1039,32 +1037,32 @@ def main() -> None:
             torch.cuda.synchronize(device)
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
-            
+
             def trace_ready_callback(prof: torch.profiler.profile):
-                log0( prof.key_averages().table( 
-                                                sort_by="self_cuda_time_total", 
-                                                row_limit=50, 
+                log0( prof.key_averages().table(
+                                                sort_by="self_cuda_time_total",
+                                                row_limit=50,
                                             ))
                 prof.export_stacks('./cuda.profile', metric='self_cuda_time_total')
                 prof.export_stacks('./cpu.profile', metric='self_cpu_time_total')
-                prof.export_chrome_trace(f"train-gpt-{rank}-chrome-trace-seq-len-{args.tokens_per_batch}.json.gz")        
-            
-            training_time_ms = 0 
-            with profiler.profile( 
+                prof.export_chrome_trace(f"train-gpt-{rank}-chrome-trace-seq-len-{args.tokens_per_batch}.json.gz")
+
+            training_time_ms = 0
+            with profiler.profile(
                                 activities=[
-                                        profiler.ProfilerActivity.CPU, 
+                                        profiler.ProfilerActivity.CPU,
                                         profiler.ProfilerActivity.CUDA
-                                ], 
-                                record_shapes=True, # record tensor shapes 
-                                profile_memory=True, # track GPU memory usage per op 
+                                ],
+                                record_shapes=True, # record tensor shapes
+                                profile_memory=True, # track GPU memory usage per op
                                 with_stack=True, # enable stack tracing
-                                with_flops=True, # capture Flops Counter 
+                                with_flops=True, # capture Flops Counter
                                 acc_events=True, # accumulate events for each cycle
                                 on_trace_ready=trace_ready_callback
             ) as prof:
                 with profiler.record_function('train_step'):
                     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-                    
+
                     zero_grad_all()
                     for step in range(args.iterations):
                         tokens_per_step = 0
@@ -1075,31 +1073,27 @@ def main() -> None:
                         start_event.record()
 
                         train_loss = torch.zeros((), device=device)
-                        
-                        for micro_step in range(grad_accum_steps):
 
-                            sync_context = nullcontext() if (not distributed or micro_step == grad_accum_steps - 1) else model.no_sync()
+                        for micro_step in range(grad_accum_steps):
+                            sync = (micro_step == grad_accum_steps - 1)
+                            ctx = nullcontext() if (not distributed or sync) else model.no_sync()
 
                             x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
-                            tokens_per_step += x.numel() 
-                            with sync_context: 
-                                with profiler.record_function("forward"):
-                                    torch.cuda.nvtx.range_push("forward")
-                                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                                        loss = model(x, y)
-                                    torch.cuda.nvtx.range_pop()
-                            
+                            tokens_per_step += x.numel()
+
+                            with ctx, profiler.record_function("forward"):
+                                torch.cuda.nvtx.range_push("forward")
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                                    loss = model(x, y)
+                                torch.cuda.nvtx.range_pop()
+
                             torch.cuda.nvtx.range_push("backward")
                             train_loss += loss.detach()
-                            loss.backward()
+                            (loss * grad_scale).backward()
                             torch.cuda.nvtx.range_pop()
-                            
+
                         train_loss *= grad_scale
 
-                        for p in base_model.parameters():
-                            if p.grad is not None:
-                                p.grad.mul_(grad_scale)
-                                
                         for group in optimizer_muon.param_groups:
                             group["momentum"] = args.muon_momentum
 
@@ -1117,17 +1111,17 @@ def main() -> None:
                             torch.cuda.nvtx.range_pop()
 
                         zero_grad_all()
-                        
+
                         end_event.record()
                         torch.cuda.synchronize(device)
 
-                        
+
                         wall_ms = 1000.0 * (time.perf_counter() - wall_t0)
                         gpu_ms = float(start_event.elapsed_time(end_event))
                         prof.step()
-                        
+
                         training_time_ms = 1000.0 * (time.perf_counter() - wall_t0)
-                        
+
                         log0(
                             # f"profiling:true "
                             # f"tokens_per_batch:{args.tokens_per_batch} "
@@ -1139,14 +1133,19 @@ def main() -> None:
                         )
         except torch.cuda.OutOfMemoryError:
             log0('oom:true ')
-        
+
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
+
         return
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-   
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1192,17 +1191,20 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            sync = (micro_step == grad_accum_steps - 1)
+            ctx = nullcontext() if (not distributed or sync) else model.no_sync()
+
             x, y = train_loader.next_batch(args.microbatch_steps, args.tokens_per_batch, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with ctx, torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
@@ -1212,8 +1214,10 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+
         for opt in optimizers:
             opt.step()
+
         zero_grad_all()
 
         step += 1
@@ -1227,6 +1231,10 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    log0(f"opt:{type(opt)} lr:{group["lr"]}")
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1272,10 +1280,16 @@ def main() -> None:
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
+        if quant_file_bytes + code_bytes >= ARTIFACT_SIZE_LIMIT_BYTES:
+            log0(
+                f"WARNING: quantized artifact exceeds the 16,000,000-byte cap: "
+                f"{quant_file_bytes + code_bytes} bytes written to final_model.int8.ptz"
+            )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
+
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
