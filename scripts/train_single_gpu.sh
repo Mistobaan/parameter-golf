@@ -1,22 +1,31 @@
 #!/bin/bash
-set -uo pipefail
+set -euo pipefail
 
 PYTHON_BIN="$(which python3)"
-SWEEP_ID="${SWEEP_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-export PROFILE="${PROFILE:-1}"
+# Keep exactly one visible GPU so launch_job.py stays on a single worker even on multi-GPU hosts.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
 export LOADER_PIN_MEMORY="${LOADER_PIN_MEMORY:-1}"
-export WARMUP_STEPS="${WARMUP_STEPS:-20}"
-export ITERATIONS="${ITERATIONS:-20}"
-export MICROBATCH_STEPS="${MICROBATCH_STEPS:-1}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
 export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
 export SEED="${SEED:-1337}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-524288}"
-export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-1000}"
-export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-100}"
+export VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-100}"
+export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-50}"
+export ITERATIONS="${ITERATIONS:-1000}"
 export WARMDOWN_ITERS="${WARMDOWN_ITERS:-3500}"
+export WARMUP_STEPS="${WARMUP_STEPS:-20}"
 export TRAIN_SEQ_LEN="${TRAIN_SEQ_LEN:-2048}"
+export TOKENS_PER_BATCH=$((TRAIN_SEQ_LEN * 296))
+
+# Note: in the current train_gpt.py, MICROBATCH_STEPS affects both grad accumulation
+# count and loader batch sizing. Keeping this at 8 matches the requested accumulation
+# behavior, but it does not give a perfectly apples-to-apples multi-GPU batch match
+# unless TOKENS_PER_BATCH is adjusted accordingly.
+export MICROBATCH_STEPS="${MICROBATCH_STEPS:-8}"
+
 export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-600.0}"
 export QK_GAIN_INIT="${QK_GAIN_INIT:-1.5}"
 export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
@@ -24,7 +33,7 @@ export NUM_LAYERS="${NUM_LAYERS:-4}"
 export NUM_KV_HEADS="${NUM_KV_HEADS:-3}"
 export NUM_HEADS="${NUM_HEADS:-3}"
 export HEAD_DIM="${HEAD_DIM:-256}"
-export MLP_MULT="${MLP_MULT:-3}"
+export MLP_MULT="${MLP_MULT:-1}"
 export TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 export ROPE_BASE="${ROPE_BASE:-100000.0}"
 export LOGIT_SOFTCAP="${LOGIT_SOFTCAP:-10.0}"
@@ -48,22 +57,13 @@ export RANK="${RANK:-0}"
 export WORLD_SIZE="${WORLD_SIZE:-1}"
 export LOCAL_RANK="${LOCAL_RANK:-0}"
 
-export EXPERIMENT_ID="${EXPERIMENT_ID:-profile_batch_size_${SWEEP_ID}}"
-BATCH_MULTS="${BATCH_MULTS:-264 272 280 288 296 304 312 320 328}"
+export EXPERIMENT_ID="${EXPERIMENT_ID:-train_single_gpu}"
+export RUN_ID="${RUN_ID:-${EXPERIMENT_ID}_${STAMP}_seq${TRAIN_SEQ_LEN}_tok${TOKENS_PER_BATCH}_acc${MICROBATCH_STEPS}}"
+export TRACKIO_PROJECT="train-${NUM_LAYERS}-${MLP_MULT}"
 
-status=0
-echo "Starting batch-size sweep: sweep_id=${SWEEP_ID} train_seq_len=${TRAIN_SEQ_LEN} mults=${BATCH_MULTS}"
+echo "Launching single-GPU training"
+echo "RUN_ID=${RUN_ID}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "TRAIN_SEQ_LEN=${TRAIN_SEQ_LEN} TOKENS_PER_BATCH=${TOKENS_PER_BATCH} MICROBATCH_STEPS=${MICROBATCH_STEPS}"
 
-for mult in ${BATCH_MULTS}; do
-    export TOKENS_PER_BATCH=$((TRAIN_SEQ_LEN * mult))
-    export RUN_ID="${EXPERIMENT_ID}_seq${TRAIN_SEQ_LEN}_mult${mult}_tok${TOKENS_PER_BATCH}_pin${LOADER_PIN_MEMORY}"
-
-    echo
-    echo "=== RUN_ID=${RUN_ID} TOKENS_PER_BATCH=${TOKENS_PER_BATCH} (${mult}x TRAIN_SEQ_LEN) ==="
-    if ! "${PYTHON_BIN}" scripts/launch_job.py; then
-        status=1
-        echo "run failed: ${RUN_ID}"
-    fi
-done
-
-exit "${status}"
+"${PYTHON_BIN}" scripts/launch_job.py

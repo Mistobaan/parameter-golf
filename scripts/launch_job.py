@@ -151,13 +151,14 @@ def remap_metrics(
 
 
 def main():
+    trackio_project = os.environ.get("TRACKIO_PROJECT", "project")
     trackio_space = os.environ.get("TRACKIO_SPACE_ID")
     experiment = os.environ.get('EXPERIMENT_ID')
     run_id = os.environ.get("RUN_ID", None)
     ngpus = torch.cuda.device_count()
 
     run = trackio.init(
-        project="parameter-golf",
+        project=trackio_project,
         name=run_id,
         auto_log_gpu=ngpus > 0,
         config={
